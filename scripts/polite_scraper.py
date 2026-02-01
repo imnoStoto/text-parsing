@@ -17,7 +17,7 @@ What it does NOT do
 
 Example:
 Crawl only under a path prefix:
-   python generic_site_downloader.py \
+   polite_scraper.py \
      --start "https://example.com/resources/index.html" \
      --out "example-downloads" \
      --ext "pdf,png,zip" \
