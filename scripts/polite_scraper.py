@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_site_downloader.py
+polite_scraper.py
 
 A reusable, polite crawler + downloader for *publicly linked* documents.
 
@@ -15,17 +15,8 @@ What it does NOT do
 - Does not bypass auth, brute force, or scrape restricted areas.
 - Only follows links it can fetch normally as a public user.
 
-Examples
-1) DOJ Epstein Court Records PDFs:
-   python generic_site_downloader.py \
-     --start "https://www.justice.gov/epstein/court-records" \
-     --out "downloads" \
-     --ext "pdf" \
-     --scope "host" \
-     --age-gate-substring "/age-verify" \
-     --age-submit-value "Yes"
-
-2) Crawl only under a path prefix:
+Example:
+Crawl only under a path prefix:
    python generic_site_downloader.py \
      --start "https://example.com/resources/index.html" \
      --out "example-downloads" \
