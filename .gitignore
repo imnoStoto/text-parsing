@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data (DO NOT COMMIT)
+data/raw/
+data/processed/
+out/
+
+# OS junk
+.DS_Store
+
