@@ -80,6 +80,10 @@ def is_html_response(resp: requests.Response) -> bool:
 def default_user_agent() -> str:
     return "Mozilla/5.0 (compatible; generic_site_downloader/1.0)"
 
+def looks_like_age_gate_html(html_text: str) -> bool:
+    s = html_text.lower()
+    return ("are you 18 years of age or older" in s) or ("/age-verify" in s)
+
 
 # ----------------------------
 # Data structures
@@ -138,64 +142,67 @@ def pass_age_gate(
     sleep: float,
     timeout: int,
     submit_value: str = "Yes",
-    submit_field_preference: Tuple[str, ...] = ("op",),
     user_agent: str = "",
 ) -> None:
     """
-    Generic form submitter for "age verification" pages.
-    - GET gate_url
-    - Parse first <form>
-    - POST same form action with all inputs, and set a submit field to submit_value
-
-    This is intentionally generic; if a site uses JS-heavy gates, this may not work.
+    Robust age-gate handler for justice.gov:
+    - GET the age-verify page
+    - Find the *correct* form (not the header search form)
+      by looking for:
+        - action containing 'age-verify', OR
+        - an input named 'destination'
+    - POST the form with op=Yes (or equivalent)
     """
+    import time
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin
+
+    headers = {"User-Agent": user_agent or "Mozilla/5.0"}
     time.sleep(sleep)
-    r = session.get(gate_url, timeout=timeout, headers={"User-Agent": user_agent or default_user_agent()})
+    r = session.get(gate_url, timeout=timeout, headers=headers, allow_redirects=True)
     r.raise_for_status()
+
     soup = BeautifulSoup(r.text, "html.parser")
+    forms = soup.find_all("form")
 
-    form = soup.find("form")
-    if not form:
-        raise RuntimeError(f"No form found on age gate page: {gate_url}")
+    # Pick the right form: prefer one that targets age-verify or has the 'destination' field.
+    chosen = None
+    for f in forms:
+        action = (f.get("action") or "").lower()
+        has_destination = f.find("input", {"name": "destination"}) is not None
+        if "age-verify" in action or has_destination:
+            chosen = f
+            break
 
-    action = form.get("action") or gate_url
+    if not chosen:
+        # Fallback: some templates use links/buttons; try anchor containing "Yes"
+        yes_link = soup.find("a", string=lambda s: s and s.strip().lower() == "yes")
+        if yes_link and yes_link.get("href"):
+            time.sleep(sleep)
+            session.get(urljoin(gate_url, yes_link["href"]), timeout=timeout, headers=headers, allow_redirects=True).raise_for_status()
+            return
+        raise RuntimeError(f"Could not find age-verify form on: {gate_url}")
+
+    action = chosen.get("action") or gate_url
     post_url = urljoin(gate_url, action)
 
-    data: Dict[str, str] = {}
-    for inp in form.find_all("input"):
+    data = {}
+    for inp in chosen.find_all("input"):
         name = inp.get("name")
         if not name:
             continue
         data[name] = inp.get("value", "")
 
-    # Try preferred submit fields first (e.g. "op")
-    set_submit = False
-    for field in submit_field_preference:
-        if field in data:
-            data[field] = submit_value
-            set_submit = True
-            break
-
-    # Otherwise set a submit input if present
-    if not set_submit:
-        submit = form.find("input", {"type": "submit"})
-        if submit and submit.get("name"):
-            data[submit["name"]] = submit.get("value", submit_value) or submit_value
-            set_submit = True
-
-    # If still not set, just add an 'op' as a last resort
-    if not set_submit:
+    # Common pattern: Drupal form uses 'op' for the clicked button text.
+    if "op" in data:
         data["op"] = submit_value
+    else:
+        data["op"] = submit_value  # safe default
 
     time.sleep(sleep)
-    pr = session.post(
-        post_url,
-        data=data,
-        timeout=timeout,
-        allow_redirects=True,
-        headers={"User-Agent": user_agent or default_user_agent()},
-    )
+    pr = session.post(post_url, data=data, timeout=timeout, headers=headers, allow_redirects=True)
     pr.raise_for_status()
+
 
 
 # ----------------------------
@@ -346,25 +353,77 @@ def download_one(
         return True
 
     try:
+        # ------------------------------------------------------------
+        # 1) PROBE REQUEST (stream=False so we can read HTML easily)
+        # ------------------------------------------------------------
         time.sleep(sleep)
-        r = session.get(item.url, timeout=timeout, stream=True, allow_redirects=True, headers={"User-Agent": user_agent})
+        r = session.get(
+            item.url,
+            timeout=timeout,
+            stream=False,
+            allow_redirects=True,
+            headers={"User-Agent": user_agent},
+        )
         r.raise_for_status()
 
-        # If redirected to age gate, pass it and retry original URL
+        # ------------------------------------------------------------
+        # 2) AGE-GATE HANDLING
+        #    A) redirect to /age-verify (your original behavior)
+        #    B) gate HTML served at the media URL itself (new behavior)
+        # ------------------------------------------------------------
+        hit_gate = False
+
+        # A) redirected URL contains known substring (e.g., "/age-verify")
         if age_gate_substring and age_gate_substring in r.url:
+            hit_gate = True
+
+        # B) HTML response that looks like the DOJ gate page
+        #    (even when URL is still the original media URL)
+        if is_html_response(r):
+            # Lightweight heuristic; adjust if needed
+            snippet = (r.text or "")[:8000].lower()
+            if ("are you 18 years of age or older" in snippet) or ("/age-verify" in snippet):
+                hit_gate = True
+
+        if hit_gate:
             pass_age_gate(
                 session=session,
-                gate_url=r.url,
+                gate_url=r.url,  # important: use the page we actually got (contains form tokens)
                 sleep=sleep,
                 timeout=timeout,
                 submit_value=age_submit_value,
                 user_agent=user_agent,
             )
+
+            # Re-fetch the original media URL after verification (still probe)
             time.sleep(sleep)
-            r = session.get(item.url, timeout=timeout, stream=True, allow_redirects=True, headers={"User-Agent": user_agent})
+            r = session.get(
+                item.url,
+                timeout=timeout,
+                stream=False,
+                allow_redirects=True,
+                headers={"User-Agent": user_agent},
+            )
             r.raise_for_status()
 
-        # Avoid saving HTML into a "pdf" etc.
+        # Still HTML after attempting gate? Don't save.
+        if is_html_response(r):
+            return False
+
+        # ------------------------------------------------------------
+        # 3) STREAMING DOWNLOAD (now that we expect binary)
+        # ------------------------------------------------------------
+        time.sleep(sleep)
+        r = session.get(
+            item.url,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=True,
+            headers={"User-Agent": user_agent},
+        )
+        r.raise_for_status()
+
+        # Final guard: never save HTML
         if is_html_response(r):
             return False
 
@@ -374,8 +433,11 @@ def download_one(
                     f.write(chunk)
         return True
 
-    except Exception:
-        return False
+    except Exception as e:
+        print(f"FAIL: {item.url} ({type(e).__name__}: {e})", flush=True)
+    return False
+
+
 
 
 # ----------------------------
@@ -396,6 +458,7 @@ def main():
     ap.add_argument("--ignore-paths", default=None, help=r"Regex of URL paths to ignore, e.g. '/tag/|/login'")
     ap.add_argument("--user-agent", default=default_user_agent(), help="Custom User-Agent string")
 
+    
     # Optional age-gate automation
     ap.add_argument("--age-gate-substring", default=None, help="If a redirect URL contains this substring, try to pass gate form")
     ap.add_argument("--age-submit-value", default="Yes", help="Value to submit on the age gate form (default: Yes)")
@@ -413,7 +476,22 @@ def main():
     ignore_re = re.compile(args.ignore_paths) if args.ignore_paths else None
 
     session = requests.Session()
+    user_agent = args.user_agent  # already parsed by argparse
 
+    # Optional: warm up DOJ age verification once so cookies stick
+    if args.age_gate_substring:
+        try:
+            pass_age_gate(
+                session=session,
+                gate_url="https://www.justice.gov/age-verify?destination=/epstein/doj-disclosures",
+                sleep=args.sleep,
+                timeout=args.timeout,
+                submit_value=args.age_submit_value,
+                user_agent=user_agent,
+            )
+            print("Age gate warm-up successful", flush=True)
+        except Exception as e:
+            print(f"Age gate warm-up failed (continuing anyway): {e}", flush=True)
     seen_pages, items = crawl_and_collect(
         session=session,
         start_url=start_url,
